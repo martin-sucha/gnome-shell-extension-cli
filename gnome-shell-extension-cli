@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+import argparse
+import io
+import pathlib
+import shutil
+import subprocess
+import re
+import sys
+import zipfile
+from urllib.parse import urljoin
+import requests
+import os.path
+
+
+# TODO: check if the system path is in GLib.get_system_data_dirs() as that's what Gnome Shell uses
+SYSTEM_INSTALL_PATH = pathlib.Path('/usr/local/share/gnome-shell/extensions/')
+USER_INSTALL_PATH = pathlib.Path.home().joinpath('.local/share/gnome-shell/extensions/')
+GSETTINGS_EXTENSIONS_KEY = 'enabled-extensions'
+EXTENSION_STATES = {
+    1: 'enabled',
+    2: 'disabled',
+    3: 'error',
+    4: 'out of date',
+    5: 'downloading',
+    6: 'initialized',
+}
+EXTENSION_TYPES = {
+    1: 'system',
+    2: 'user',
+}
+BASE_URL = 'https://extensions.gnome.org'
+INFO_URL = urljoin(BASE_URL, '/extension-info/')
+
+
+def get_gnome_shell_version():
+    try:
+        return gnome_shell_proxy().get_cached_property("ShellVersion").get_string()
+    except Exception:
+        result = subprocess.run(['gnome-shell', '--version'], check=True, stdout=subprocess.PIPE)
+        match = re.search(r'GNOME Shell (\d+\.\d+\.\d+)', result.stdout.decode('UTF-8'))
+        if not match:
+            raise ValueError('Could not find version in output')
+        return match.group(1)
+
+
+def is_uuid(s):
+    # https://wiki.gnome.org/Projects/GnomeShell/Extensions/UUIDGuidelines
+    return bool(re.match(r'^[-a-zA-Z0-9@._]+$', s))
+
+
+def parse_pk_from_url(url):
+    match = re.match('^' + re.escape(BASE_URL) + r'/extension/(\d+)/', url)
+    if not match:
+        raise ValueError(f'Could not extract ID from {repr(url)}')
+    return int(match.group(1))
+
+
+def fetch_extension_info(gnome_shell_version, **params):
+    response = requests.get(INFO_URL,
+                            params=dict(params, shell_version=gnome_shell_version))
+    response.raise_for_status()
+    return response.json()
+
+
+def extract(archive, dest_path):
+    dest_path = pathlib.Path(dest_path).resolve(strict=True)
+    for info in archive.infolist():
+        # Some sanity checks to avoid extracting outside of dest_path
+        if '/../' in info.filename or '\\..\\' in info.filename or '/./' in info.filename or '/../' in info.filename:
+            raise ValueError(f'Cannot extract path with relative components: {info.filename}')
+
+        filename = pathlib.Path(info.filename)
+        if filename.is_absolute():
+            raise ValueError(f'Cannot extract absolute filename: {info.filename}')
+
+        item_path = pathlib.Path(dest_path, filename).resolve()
+
+        # resolve parent directory
+        try:
+            levels = item_path.parents.index(dest_path)
+        except ValueError:
+            # dest_path is not a parent of item_path, so is unsafe
+            raise ValueError(f'Cannot extract outside destination directory: {info.filename}')
+        parents_from_dest_path = reversed(list(item_path.parents)[:levels])
+        for parent in parents_from_dest_path:
+            if not parent.is_dir():
+                parent.mkdir()
+        if info.is_dir():
+            if not item_path.is_dir():
+                item_path.mkdir()
+        else:
+            with open(item_path, 'xb') as target, archive.open(info) as source:
+                shutil.copyfileobj(source, target)
+
+
+def enable_extension(extension_uuid):
+    from gi.repository import Gio
+
+    settings = Gio.Settings(schema='org.gnome.shell')
+    extensions = settings.get_strv(GSETTINGS_EXTENSIONS_KEY)
+
+    if extension_uuid in extensions:
+        return False  # already enabled
+
+    extensions.append(extension_uuid)
+    settings.set_strv(GSETTINGS_EXTENSIONS_KEY, extensions)
+    return True
+
+
+def disable_extension(extension_uuid):
+    from gi.repository import Gio
+
+    settings = Gio.Settings(schema='org.gnome.shell')
+    extensions = settings.get_strv(GSETTINGS_EXTENSIONS_KEY)
+
+    if extension_uuid not in extensions:
+        return False  # was not enabled
+
+    extensions = [x for x in extensions if x != extension_uuid]
+
+    settings.set_strv(GSETTINGS_EXTENSIONS_KEY, extensions)
+    return True
+
+
+def gnome_shell_proxy():
+    from gi.repository import Gio
+
+    return Gio.DBusProxy.new_sync(Gio.bus_get_sync(Gio.BusType.SESSION, None),
+                                  Gio.DBusProxyFlags.NONE,
+                                  None,
+                                  'org.gnome.Shell',
+                                  '/org/gnome/Shell',
+                                  'org.gnome.Shell.Extensions',
+                                  None)
+
+
+def reload_extension(extension_uuid):
+    from gi.repository import Gio, GLib
+
+    proxy = gnome_shell_proxy()
+    proxy.call_sync('ReloadExtension',
+                    GLib.Variant('(s)', (extension_uuid,)),
+                    Gio.DBusCallFlags.NONE,
+                    -1,
+                    None)
+
+
+def list_extensions():
+    from gi.repository import Gio
+
+    proxy = gnome_shell_proxy()
+    result = proxy.call_sync('ListExtensions', None, Gio.DBusCallFlags.NONE, -1, None)
+    return result.unpack()[0]
+
+
+def get_install_path(args):
+    if args.system:
+        return SYSTEM_INSTALL_PATH
+    elif args.install_path is not None:
+        return pathlib.Path(args.install_path)
+    else:
+        return USER_INSTALL_PATH
+
+
+def other_installed_paths(install_path, uuid):
+    for path in SYSTEM_INSTALL_PATH, USER_INSTALL_PATH:
+        ext_path = path.joinpath(uuid).resolve()
+        if ext_path != install_path and ext_path.is_dir():
+            yield path
+
+
+def note_other_installed_paths(extension_path, extension_uuid):
+    other_paths = list(other_installed_paths(extension_path, extension_uuid))
+    if other_paths:
+        print('Note: The extension is also installed in the following paths:', file=sys.stderr)
+        for other_path in other_paths:
+            print(other_path)
+    return other_paths
+
+
+def cmd_install(args):
+    install_path = get_install_path(args)
+
+    extension_info = resolve_extension_info(args)
+
+    extension_uuid = extension_info['uuid']
+    download_url = urljoin(BASE_URL, extension_info['download_url'])
+
+    # Validate UUID as it's used as directory name later
+    if not is_uuid(extension_uuid):
+        raise ValueError(f'Invalid extension UUID: {extension_uuid}')
+
+    if not install_path.is_dir():
+        os.makedirs(install_path)
+
+    extension_path = install_path.joinpath(extension_uuid)
+    if extension_path.exists():
+        print('Extension already installed', file=sys.stderr)
+        return
+
+    try:
+        extensions = list_extensions()
+    except Exception:
+        extensions = {}
+
+    install = True
+    if extension_uuid in extensions:
+        print('Extension is already installed in {path}'.format(path=extensions[extension_uuid]['path']),
+              file=sys.stderr)
+        if not not args.multiple:
+            install = False
+    else:
+        other_installed_paths = note_other_installed_paths(extension_path, extension_uuid)
+        if other_installed_paths and not args.multiple:
+            install = False
+
+    if install:
+        # Download the extension into memory
+        downloaded = requests.get(download_url)
+        downloaded.raise_for_status()
+
+        extension_path.mkdir()  # fail if exists
+
+        with zipfile.ZipFile(io.BytesIO(downloaded.content)) as archive:
+            extract(archive, extension_path)
+
+    # Enable the extension
+    if args.enable:
+        try:
+            enable_extension(extension_uuid)
+        except Exception as e:
+            print(f'Warning: Could not enable the extension: {e}', file=sys.stderr)
+
+
+def resolve_extension_info(args):
+    gnome_shell_version = get_gnome_shell_version()
+    try:
+        extension_pk = parse_pk_from_url(args.extension_spec)
+    except ValueError:
+        if is_uuid(args.extension_spec):
+            query = {'uuid': args.extension_spec}
+    else:
+        query = {'pk': extension_pk}
+    extension_info = fetch_extension_info(gnome_shell_version, **query)
+    return extension_info
+
+
+def cmd_uninstall(args):
+    install_path = get_install_path(args)
+    extension_uuid = resolve_extension_uuid(args)
+
+    # disable the extension first
+    if args.disable:
+        try:
+            disable_extension(extension_uuid)
+        except Exception as e:
+            print(f'Warning: Could not disable the extension: {e}', file=sys.stderr)
+
+    extension_path = pathlib.Path(install_path, extension_uuid)
+
+    note_other_installed_paths(extension_path, extension_uuid)
+
+    if not extension_path.exists():
+        print(f'Extension was not found in {extension_path}', file=sys.stderr)
+        return
+
+    shutil.rmtree(extension_path)
+
+
+def cmd_enable(args):
+    extension_uuid = resolve_extension_uuid(args)
+    enable_extension(extension_uuid)
+
+
+def cmd_disable(args):
+    extension_uuid = resolve_extension_uuid(args)
+    disable_extension(extension_uuid)
+
+
+def cmd_reload(args):
+    extension_uuid = resolve_extension_uuid(args)
+    reload_extension(extension_uuid)
+
+
+def cmd_list(args):
+    import json
+
+    extensions = list_extensions()
+
+    if args.json:
+        print(json.dumps(extensions, indent=2))
+    else:
+        for extension in sorted(extensions.values(), key=lambda x: x['name']):
+            print('{name}'.format(name=extension['name']))
+            print('  state: {state}'.format(state=EXTENSION_STATES.get(extension['state'], '(unknown)')))
+            print('  url: {url}'.format(url=extension['url']))
+            print('  uuid: {uuid}'.format(uuid=extension['uuid']))
+            print('  type: {type}'.format(type=EXTENSION_TYPES.get(extension['type'], '(unknown)')))
+            print('  path: {path}'.format(path=extension['path']))
+
+
+def cmd_info(args):
+    import json
+
+    extension_info = resolve_extension_info(args)
+
+    if args.json:
+        print(json.dumps(extension_info, indent=2))
+    else:
+        indented_descrption = extension_info['description'].rstrip('\n').replace('\n', '\n    ')
+
+        print('{name}'.format(name=extension_info['name']))
+        print('  link: {url}'.format(url=urljoin(BASE_URL, extension_info['link'])))
+        print('  uuid: {uuid}'.format(uuid=extension_info['uuid']))
+        print('  download url: {url}'.format(url=urljoin(BASE_URL, extension_info['download_url'])))
+        print('  creator url: {url}'.format(url=urljoin(BASE_URL, extension_info['creator_url'])))
+        print('  description:\n    {description}'.format(description=indented_descrption))
+
+
+def resolve_extension_uuid(args):
+    try:
+        extension_pk = parse_pk_from_url(args.extension_spec)
+    except ValueError:
+        # The supplied value might also be UUID
+        if is_uuid(args.extension_spec):
+            extension_uuid = args.extension_spec
+        else:
+            raise ValueError(f'Could not extract ID or UUID from {repr(args.extension_spec)}')
+    else:
+        gnome_shell_version = get_gnome_shell_version()
+        extension_info = fetch_extension_info(gnome_shell_version, pk=extension_pk)
+        extension_uuid = extension_info['uuid']
+
+        # Validate UUID as it's used as directory name later
+        if not is_uuid(extension_uuid):
+            raise ValueError(f'Invalid extension UUID: {extension_uuid}')
+    return extension_uuid
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers()
+
+    def path_arguments(subparser):
+        group = subparser.add_mutually_exclusive_group()
+        group.add_argument('--system', action='store_true', help='Install to system extension path')
+        group.add_argument('--install-path', help='Install to custom path')
+
+    def spec_argument(subparser):
+        subparser.add_argument('extension_spec',
+                               help='Either UUID or extensions.gnome.org URL')
+
+    install_parser = subparsers.add_parser('install')
+    spec_argument(install_parser)
+    path_arguments(install_parser)
+    install_parser.add_argument('--no-enable', dest='enable', action='store_false', help='Do not enable the extension')
+    install_parser.add_argument('--multiple', action='store_true',
+                                help='Allow extension to be installed multiple times in different locations')
+    install_parser.set_defaults(fn=cmd_install)
+
+    uninstall_parser = subparsers.add_parser('uninstall')
+    spec_argument(uninstall_parser)
+    path_arguments(uninstall_parser)
+    uninstall_parser.add_argument('--no-disable', dest='disable', action='store_false',
+                                  help='Do not disable the extension')
+    uninstall_parser.set_defaults(fn=cmd_uninstall)
+
+    enable_parser = subparsers.add_parser('enable')
+    spec_argument(enable_parser)
+    enable_parser.set_defaults(fn=cmd_enable)
+
+    disable_parser = subparsers.add_parser('disable')
+    spec_argument(disable_parser)
+    disable_parser.set_defaults(fn=cmd_disable)
+
+    reload_parser = subparsers.add_parser('reload')
+    spec_argument(reload_parser)
+    reload_parser.set_defaults(fn=cmd_reload)
+
+    list_parser = subparsers.add_parser('list')
+    list_parser.add_argument('--json', action='store_true', help='Return the list as JSON')
+    list_parser.set_defaults(fn=cmd_list)
+
+    info_parser = subparsers.add_parser('info')
+    spec_argument(info_parser)
+    info_parser.add_argument('--json', action='store_true', help='Return the info as JSON')
+    info_parser.set_defaults(fn=cmd_info)
+
+    args = parser.parse_args()
+
+    if not hasattr(args, 'fn'):
+        parser.print_usage()
+    else:
+        args.fn(args)
